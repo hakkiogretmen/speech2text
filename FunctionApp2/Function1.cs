@@ -20,11 +20,11 @@ namespace FunctionApp2
 {
     public static class Function1
     {
-        private static List<string> _lines;
+        //private static List<string> _lines;
 
         [FunctionName("Function1")]
         public async static Task Run([BlobTrigger("audiostorage/{name}", Connection = "AzureWebJobsStorage")]CloudBlockBlob myBlob, string name, ILogger log,
-                [Blob("cpxoutput/{name}", Connection = "AzureWebJobsStorage")] CloudBlockBlob outputBlob,
+                [Blob("cpxoutput/{name}.json", Connection = "AzureWebJobsStorage")] CloudBlockBlob outputBlob,
                 [CosmosDB(
                 databaseName: "cpxspeechdb",
                 collectionName: "jsonresults",
@@ -46,8 +46,9 @@ namespace FunctionApp2
             config.SpeechRecognitionLanguage = language;
             config.OutputFormat = OutputFormat.Detailed;
             // Replace with the CRIS endpoint id of your customized model.
-            //config.EndpointId = "YourEndpointId";
-                       
+            config.EndpointId = "2378023b-1931-466f-83eb-38ad3b74b5f3";
+            
+
             await outputBlob.UploadTextAsync(JsonConvert.SerializeObject(myBlob.Properties)).ConfigureAwait(false);
 
             // Create a push stream
@@ -56,7 +57,7 @@ namespace FunctionApp2
 
             // Creates a speech recognizer using file as audio input.
             // Replace with your own audio file name.
-                using (var audioInput = AudioConfig.FromWavFileInput(myBlob.StorageUri.PrimaryUri.LocalPath))
+                using (var audioInput = AudioConfig.FromStreamInput(pushStream))
                 {
 
                     log.LogInformation("#######################START#########################");
