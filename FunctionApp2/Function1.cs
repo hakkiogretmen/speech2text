@@ -15,12 +15,145 @@ using System.Threading;
 using System.Collections.Generic;
 using System;
 using Microsoft.WindowsAzure.Storage.RetryPolicies;
+using System.Net.Http;
+using System.Net.Http.Headers;
 
 namespace FunctionApp2
 {
+
     public static class Function1
     {
-        //private static List<string> _lines;
+        private const string token = "21ce1a536aa3d5c3e39dee7805739244a3b72e23b2";
+        static string SessionId { get; set; }
+
+        private static async Task OpenSession(ILogger logger)
+        {
+            using (var httpClient = new HttpClient())
+            {
+                httpClient.DefaultRequestHeaders.Add("X-Zoom-S2T-Key", token);
+                StringContent stringContent = new StringContent("{\"language\":\"en-us\"}");
+                stringContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                HttpResponseMessage httpResponseMessage = await httpClient.PostAsync("https://api.zoommedia.ai/api/v1/speech-to-text/session", stringContent).ConfigureAwait(false);
+                logger.LogInformation("open session response: " + httpResponseMessage);
+                if (httpResponseMessage.IsSuccessStatusCode)
+                {
+                    string sessionString = await httpResponseMessage.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    JToken token = JObject.Parse(sessionString);
+                    SessionId = (string)token.SelectToken("sessionId");
+                    string language = (string)token.SelectToken("language");
+                    logger.LogInformation("session id: " + SessionId);
+                    logger.LogInformation("language: " + language);
+                }
+                else
+                {
+                    string failureMsg = "HTTP Status: " + httpResponseMessage.StatusCode.ToString() + " - Reason: " + httpResponseMessage.ReasonPhrase;
+                }
+            }
+        }
+
+        
+        private static async Task<string> UploadFileMultipart(string fileName, byte[] fileBytes, ILogger logger)
+        {
+            HttpContent bytesContent = new ByteArrayContent(fileBytes);
+
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.TryAddWithoutValidation("Content-Type", "multipart/form-data");
+                client.DefaultRequestHeaders.Add("X-Zoom-S2T-Key", token);
+                using (var formData = new MultipartFormDataContent())
+                {
+
+                    formData.Add(bytesContent, "upload", fileName);
+                    logger.LogInformation("https://api.zoommedia.ai/api/v1/api/v1/speech-to-text/session/" + SessionId);
+                    HttpResponseMessage response = await client.PostAsync(string.Format("https://api.zoommedia.ai/api/v1/speech-to-text/session/{0}", SessionId), formData).ConfigureAwait(false);
+                    logger.LogInformation($"[VERBOSE]::Upload Response:{response}");
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        
+                        logger.LogError($"[ERROR]::Error while getting response from zoommedia. Status Code: {response.StatusCode}");
+                        return null;
+                    }
+                    return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                }
+            }
+        }
+        
+        //unused function
+        private static async Task<string> UploadFileViaUrl(string fileName, string url, ILogger logger)
+        {
+            using (var httpClient = new HttpClient())
+            {
+                logger.LogInformation("file url: " + url);
+                httpClient.DefaultRequestHeaders.Add("X-Zoom-S2T-Key", token);
+                StringContent stringContent = new StringContent("{\"video_url\":\"https://cpxblob.blob.core.windows.net/audiostorage/f2bjrop10.wav\"}");
+                stringContent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                var response = await httpClient.PostAsync(string.Format("https://api.zoommedia.ai/api/v1/api/v1/speech-to-text/session/{0}", SessionId), stringContent).ConfigureAwait(false);
+                logger.LogInformation(response.ToString());
+                if (response.IsSuccessStatusCode)
+                {
+                    string sessionString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    JToken token = JObject.Parse(sessionString);
+                    SessionId = (string)token.SelectToken("sessionId");
+                    logger.LogInformation(SessionId);
+                    return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                }
+                return null;
+            }
+        }
+
+        static async Task<string> GetResultAsync(DocumentClient jsonresults, ILogger log)
+        {
+            HttpClient client = new HttpClient();
+            client.DefaultRequestHeaders.Add("X-Zoom-S2T-Key", token);
+            client.DefaultRequestHeaders
+              .Accept
+              .Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            string actuallyDone = string.Empty;
+            HttpResponseMessage response = new HttpResponseMessage();
+            while (actuallyDone != "True")
+            {
+                response = await client.GetAsync(string.Format("https://api.zoommedia.ai/api/v1/speech-to-text/session/{0}", SessionId)).ConfigureAwait(false);
+                if (response.IsSuccessStatusCode)
+                {
+                    string sessionString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    JToken token = JObject.Parse(sessionString);
+                    actuallyDone = (string)token.SelectToken("done");
+                    if (actuallyDone == "True")
+                    {
+                        break;
+                    }
+                    else
+                    {
+                        Thread.Sleep(10000);
+                    }
+                }
+            }
+            string Result = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            try
+            {
+                zoomMediaResultState zrs = JsonConvert.DeserializeObject<zoomMediaResultState>(Result);
+                await jsonresults.CreateDocumentAsync("dbs/cpxspeechdb/colls/jsonresults", zrs).ConfigureAwait(false);
+
+            }
+            catch (Exception e)
+            {
+                log.LogError(e, "[ERROR]::Error while inserting JSON into COSMOS");
+                throw;
+            }
+            return Result;
+        }
+        private static async Task SaveMetaData(CloudBlockBlob myBlob, CloudBlockBlob outputBlob, ILogger logger)
+        {
+            try
+            {
+                await outputBlob.UploadTextAsync(JsonConvert.SerializeObject(myBlob.Properties)).ConfigureAwait(false);
+                logger.LogInformation("[VERBOSE]::Uploading Metadata...");
+            }
+            catch (Exception e)
+            {
+                logger.LogError(e, "[ERROR]::Error occured while uploading metadata of the source audio file.");
+            }
+        }
 
         [FunctionName("Function1")]
         public async static Task Run([BlobTrigger("audiostorage/{name}", Connection = "AzureWebJobsStorage")]CloudBlockBlob myBlob, string name, ILogger log,
@@ -32,139 +165,27 @@ namespace FunctionApp2
                 ConnectionStringSetting = "CosmosDBConnection")]
                 DocumentClient jsonresults)
         {
-            
-            string SubscriptionKey = "b92036a0d1aa4093ab84ad1ca4d3263a";
-            string ServiceRegion = "westeurope";
-            int maxRetryCount = 3;
-            var language = "en-US";
-            var stopRecognition = new TaskCompletionSource<int>();
 
-            // Creates an instance of a speech config with specified subscription key and service region.
-            // Replace with your own subscription key and service region (e.g., "westus").
-            var config = SpeechConfig.FromSubscription(SubscriptionKey, ServiceRegion);
-  
-            config.SpeechRecognitionLanguage = language;
-            config.OutputFormat = OutputFormat.Detailed;
-            // Replace with the CRIS endpoint id of your customized model.
-            config.EndpointId = "2378023b-1931-466f-83eb-38ad3b74b5f3";
-            
+            long fileByteLength = myBlob.Properties.Length;
+            byte[] fileBytes = new byte[fileByteLength];
 
-            await outputBlob.UploadTextAsync(JsonConvert.SerializeObject(myBlob.Properties)).ConfigureAwait(false);
-
-            // Create a push stream
-            using (var pushStream = AudioInputStream.CreatePushStream())
+            for (int i = 0; i < fileByteLength; i++)
             {
-
-            // Creates a speech recognizer using file as audio input.
-            // Replace with your own audio file name.
-                using (var audioInput = AudioConfig.FromStreamInput(pushStream))
-                {
-
-                    log.LogInformation("#######################START#########################");
-                    //log.LogInformation(audioInput.ToString());
-                    using (var recognizer = new SpeechRecognizer(config, audioInput))
-                    {
-
-                        // Subscribes to events.
-                        recognizer.Recognizing += (s, e) =>
-                        {
-                            log.LogInformation($"RECOGNIZING: Text={e.Result.Text}");
-                        };
-
-                        recognizer.Recognized += (s, e) =>
-                        {
-                            if (e.Result.Reason == ResultReason.RecognizedSpeech)
-                            {
-                                log.LogInformation($"RECOGNIZED: Text={e.Result.Text}");
-                                string jsonstr = JsonConvert.SerializeObject(e.Result.ToString().Substring(e.Result.ToString().IndexOf('{')));
-                                log.LogInformation($"Recognized Json={jsonstr}");
-
-                                jsonstr = jsonstr.TrimStart('\"');
-                                jsonstr = jsonstr.TrimEnd('\"');
-                                jsonstr = jsonstr.Replace("\\", "");
-
-                                try
-                                {
-                                    speechResult sr = JsonConvert.DeserializeObject<speechResult>(jsonstr);
-                                    jsonresults.CreateDocumentAsync("dbs/cpxspeechdb/colls/jsonresults", sr).ConfigureAwait(false);
-
-                                }
-                                catch (Exception)
-                                {
-
-                                    throw;
-                                }
-
-
-                            }
-                            else if (e.Result.Reason == ResultReason.NoMatch)
-                            {
-                                log.LogInformation($"NOMATCH: Speech could not be recognized.");
-                            }
-                        };
-
-                        recognizer.Canceled += (s, e) =>
-                        {
-                            log.LogInformation($"CANCELED: Reason={e.Reason}");
-
-                            if (e.Reason == CancellationReason.Error)
-                            {
-                                log.LogInformation($"CANCELED: ErrorCode={e.ErrorCode}");
-                                log.LogInformation($"CANCELED: ErrorDetails={e.ErrorDetails}");
-                                log.LogInformation($"CANCELED: Did you update the subscription info?");
-                            }
-
-                            stopRecognition.TrySetResult(0);
-                        };
-
-                        recognizer.SessionStarted += (s, e) =>
-                        {
-                            log.LogInformation("\n    Session started event.");
-                        };
-
-                        recognizer.SessionStopped += (s, e) =>
-                        {
-                            log.LogInformation("\n    Session stopped event.");
-                            log.LogInformation("\nStop recognition.");
-                            stopRecognition.TrySetResult(0);
-                        };
-
-                        // Starts continuous recognition. Uses StopContinuousRecognitionAsync() to stop recognition.
-                        await recognizer.StartContinuousRecognitionAsync().ConfigureAwait(false);
-
-                        using (MemoryStream ms = new MemoryStream())
-                        {
-                            var blobRequestOptions = new BlobRequestOptions
-                            {
-                                ServerTimeout = TimeSpan.FromSeconds(30),
-                                MaximumExecutionTime = TimeSpan.FromSeconds(120),
-                                RetryPolicy = new ExponentialRetry(TimeSpan.FromSeconds(3), maxRetryCount),
-                            };
-
-                            log.LogInformation("\n    Downloading blob to Stream async");
-                            //CancellationToken ct = new CancellationToken();
-                            myBlob.DownloadToStreamAsync(ms).Wait();
-                            pushStream.Write(ms.ToArray());
-
-                            //outputBlob.UploadFromStreamAsync(ms).Wait();
-                        };
-
-                        pushStream.Close();
-                        
-                        
-
-                        // Waits for completion.
-                        // Use Task.WaitAny to keep the task rooted.
-                        Task.WaitAny(new[] { stopRecognition.Task });
-
-                        // Stops recognition.
-                        await recognizer.StopContinuousRecognitionAsync().ConfigureAwait(false);
-
-
-                    }
-                }
+                fileBytes[i] = 0x20;
             }
-            log.LogInformation($"C# Blob trigger function Processed blob\n Name:{name}");
+            myBlob.DownloadToByteArrayAsync(fileBytes, 0).Wait();
+
+            log.LogInformation("[VERBOSE]::Blob name: " + myBlob.Name);
+            log.LogInformation("[VERBOSE]::Blob size: " + fileBytes.Length);
+
+            await SaveMetaData(myBlob, outputBlob, log).ConfigureAwait(false);
+            await OpenSession(log).ConfigureAwait(false);
+            //await UploadFileViaUrl(myBlob.Name, myBlob.Uri.AbsoluteUri, log).ConfigureAwait(false);
+            await UploadFileMultipart(myBlob.Name, fileBytes, log).ConfigureAwait(false);
+            String resultJson = await GetResultAsync(jsonresults,log).ConfigureAwait(false);
+            log.LogInformation(resultJson);
+
+            log.LogInformation($"[VERBOSE]::Blob trigger function Processed blob\n Name:{name}");
         }
     }
 }
